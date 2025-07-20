@@ -133,3 +133,4 @@ venv.bak/
 ehthumbs.db
 Thumbs.db
 .env
+/backend/.env

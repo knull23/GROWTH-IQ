@@ -1,5 +1,5 @@
 import React from 'react';
-import { ForecastChart } from './ForecastChart';
+import { ForecastChart } from '.src/ForecastChart';
 import { ForecastTable } from './ForecastTable';
 import { HistoricalChart } from './HistoricalChart';
 import { ModelComparison } from './ModelComparison';
@@ -7,7 +7,7 @@ import { ScenarioPlanner } from './ScenarioPlanner';
 import { ModelSelector } from './ModelSelector';
 import { MetricsCards } from './MetricsCards';
 import { ExportControls } from './ExportControls';
-import { PeriodSelector } from './PeriodSelector';
+import { PeriodSelector } from './src/PeriodSelector';
 import { ForecastData } from '../types/ForecastTypes';
 
 interface DashboardProps {

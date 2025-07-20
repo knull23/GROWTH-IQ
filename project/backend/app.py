@@ -1,5 +1,9 @@
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
+from pymongo import MongoClient
+from dotenv import load_dotenv
+import os
+
 try:
     from flask_pymongo import PyMongo
 except ImportError:
@@ -26,22 +30,24 @@ try:
     from bson import ObjectId
 except ImportError:
     ObjectId = None
-
+from tensorflow.keras.losses import MeanSquaredError
 # Initialize Flask app
 app = Flask(__name__)
 CORS(app)
 
+load_dotenv()
+
+# Get Mongo URI from environment
+mongo_uri = os.getenv("MONGO_URI")
+
 # MongoDB configuration
 try:
-    app.config['MONGO_URI'] = os.environ.get('MONGO_URI', 'mongodb://localhost:27017/growthiq')
-    if PyMongo:
-        mongo = PyMongo(app)
-    else:
-        mongo = None
-        print("⚠️ PyMongo not available, using fallback mode")
+    mongo_client = MongoClient(mongo_uri)
+    mongo_db = mongo_client["growthiq"]
+    print("✅ Connected to MongoDB Atlas")
 except Exception as e:
-    print(f"⚠️ MongoDB connection failed: {e}")
-    mongo = None
+    mongo_db = None
+    print(f"❌ MongoDB connection failed: {e}")
 
 
 # Model and Data Loader Class
@@ -51,55 +57,74 @@ class ModelDataLoader:
         self.model_path = self.base_path / 'model'
         self.data_path = self.base_path / 'data'
         self.output_path = self.base_path / 'output'
-        
+
         # Ensure directories exist
         self.model_path.mkdir(exist_ok=True)
         self.data_path.mkdir(exist_ok=True)
         self.output_path.mkdir(exist_ok=True)
-        
+
         self.lstm_model = None
         self.sarima_model = None
         self.scaler = None
         self.fred_data = None
         self.model_metrics = None
         self.scenario_inputs = None
-        
+
         self._load_models_and_data()
-    
+
     def _load_models_and_data(self):
         """Load pre-trained models and data files"""
         try:
             # Load LSTM model
             lstm_path = self.model_path / 'lstm_model.h5'
-            if lstm_path.exists() and load_model:
-                self.lstm_model = load_model(str(lstm_path))
-                print("✅ LSTM model loaded successfully")
+            if lstm_path.exists():
+                try:
+                    self.lstm_model = load_model(str(lstm_path), compile=False)
+                    self.lstm_model.compile(loss=MeanSquaredError())
+                    print("✅ LSTM model loaded and compiled successfully")
+                except Exception as e:
+                    print(f"❌ Error loading LSTM model: {e}")
+                    self.lstm_model = None
             else:
-                print("⚠️ LSTM model file not found or TensorFlow not available, using mock data")
-            
+                print("⚠️ LSTM model file not found")
+
             # Load SARIMA model
             sarima_path = self.model_path / 'sarima_model.pkl'
-            if sarima_path.exists() and pickle:
-                with open(sarima_path, 'rb') as f:
-                    self.sarima_model = pickle.load(f)
-                print("✅ SARIMA model loaded successfully")
+            if sarima_path.exists():
+                try:
+                    # First attempt with joblib
+                    try:
+                        self.sarima_model = joblib.load(sarima_path)
+                        print("✅ SARIMA model loaded successfully (joblib)")
+                    except Exception as joblib_err:
+                        print(f"⚠️ joblib failed, trying pickle: {joblib_err}")
+                        # Fallback to pickle
+                        with open(sarima_path, 'rb') as f:
+                            self.sarima_model = pickle.load(f)
+                        print("✅ SARIMA model loaded successfully (pickle)")
+                except Exception as e:
+                    print(f"❌ Failed to load SARIMA model: {e}")
+                    self.sarima_model = None
             else:
-                print("⚠️ SARIMA model file not found or pickle not available, using mock data")
-            
-            # Load scaler
+                print("⚠️ SARIMA model file not found")
+
+            # Load Scaler
             scaler_path = self.model_path / 'scaler.pkl'
-            if scaler_path.exists() and joblib:
-                self.scaler = joblib.load(scaler_path)
-                print("✅ Scaler loaded successfully")
+            if scaler_path.exists():
+                try:
+                    self.scaler = joblib.load(scaler_path)
+                    print("✅ Scaler loaded successfully")
+                except Exception as e:
+                    print(f"❌ Error loading scaler: {e}")
+                    self.scaler = None
             else:
-                print("⚠️ Scaler file not found or joblib not available, using mock data")
-            
-            # Load data files
+                print("⚠️ Scaler file not found")
+
+            # Load additional data files
             self._load_data_files()
-            
+
         except Exception as e:
-            print(f"Error loading models: {e}")
-            print("Using mock data for demonstration")
+            print(f"❌ Unexpected error during model/data loading: {e}")
     
     def _load_data_files(self):
         """Load CSV data files"""
@@ -139,19 +164,71 @@ class ModelDataLoader:
         except Exception as e:
             print(f"Error generating forecast: {e}")
             return self._generate_mock_forecast(model_type, periods)
-    
+
     def _lstm_forecast(self, periods):
         """Generate LSTM forecast using pre-trained model"""
-        # This would use your actual LSTM model
-        # For now, generating realistic mock data
-        return self._generate_mock_forecast('lstm', periods)
-    
+        if self.lstm_model is None or self.scaler is None or self.fred_data is None:
+            print("❌ Required components not loaded for LSTM forecast")
+            return None
+
+        try:
+            # Step 1: Get the last N steps of historical data
+            data = self.fred_data.copy()
+            last_n = 12  # number of time steps used in training
+            last_values = data['Revenue'].values[-last_n:]
+
+            # Step 2: Scale data
+            scaled_values = self.scaler.transform(last_values.reshape(-1, 1))
+
+            # Step 3: Predict iteratively
+            forecast = []
+            input_seq = scaled_values.reshape(1, last_n, 1)
+            for _ in range(periods):
+                next_pred = self.lstm_model.predict(input_seq, verbose=0)
+                forecast.append(next_pred[0, 0])
+                # Append prediction and slide window
+                input_seq = np.append(input_seq[:, 1:, :], [[[next_pred[0, 0]]]], axis=1)
+
+            # Step 4: Inverse transform
+            forecast = self.scaler.inverse_transform(np.array(forecast).reshape(-1, 1)).flatten()
+
+            # Step 5: Create forecast DataFrame
+            last_date = pd.to_datetime(data['Date'].iloc[-1])
+            future_dates = pd.date_range(start=last_date + pd.DateOffset(months=1), periods=periods, freq='MS')
+
+            forecast_df = pd.DataFrame({'Date': future_dates, 'Forecast': forecast})
+            return forecast_df
+
+        except Exception as e:
+            print(f"❌ LSTM forecast error: {e}")
+            return None
+
     def _sarima_forecast(self, periods):
         """Generate SARIMA forecast using pre-trained model"""
-        # This would use your actual SARIMA model
-        # For now, generating realistic mock data
-        return self._generate_mock_forecast('sarima', periods)
-    
+        if self.sarima_model is None or self.fred_data is None:
+            print("❌ SARIMA model or data not loaded")
+            return None
+
+        try:
+            # Step 1: Forecast future periods
+            forecast_values = self.sarima_model.forecast(steps=periods)
+
+            # Step 2: Generate future dates
+            last_date = pd.to_datetime(self.fred_data['Date'].iloc[-1])
+            future_dates = pd.date_range(start=last_date + pd.DateOffset(months=1), periods=periods, freq='MS')
+
+            # Step 3: Format result as DataFrame
+            forecast_df = pd.DataFrame({
+                'Date': future_dates,
+                'Forecast': forecast_values
+            })
+
+            return forecast_df
+
+        except Exception as e:
+            print(f"❌ SARIMA forecast error: {e}")
+            return None
+
     def _generate_mock_forecast(self, model_type, periods):
         """Generate mock forecast data for demonstration"""
         base_revenue = 1000000
@@ -257,9 +334,11 @@ def get_forecast():
     try:
         # Generate forecast using pre-trained models
         forecasts = model_loader.generate_forecast(model_type, periods)
-        
+
+        if not forecasts:
+            return jsonify({'error': 'Forecast generation failed'}), 500
         # Save forecast run to MongoDB
-        if mongo:
+        if mongo_db:
             try:
                 forecast_run = {
                     'model_type': model_type,
@@ -268,7 +347,7 @@ def get_forecast():
                     'user_id': request.args.get('user_id', 'anonymous'),
                     'created_at': datetime.utcnow()
                 }
-                mongo.db.forecast_runs.insert_one(forecast_run)
+                mongo_db.db.forecast_runs.insert_one(forecast_run)
                 
                 # Save individual forecasts to MongoDB
                 forecast_documents = []
@@ -284,7 +363,7 @@ def get_forecast():
                     })
                 
                 if forecast_documents:
-                    mongo.db.forecasts.insert_many(forecast_documents)
+                    mongo_db.db.forecasts.insert_many(forecast_documents)
             except Exception as e:
                 print(f"⚠️ MongoDB save failed: {e}")
         
@@ -347,9 +426,9 @@ def export_forecast():
         model_type = request.args.get('model', 'lstm')
         
         # Get latest forecast from MongoDB
-        if mongo:
+        if mongo_db:
             try:
-                latest_forecasts = list(mongo.db.forecasts.find(
+                latest_forecasts = list(mongo_db.db.forecasts.find(
                     {'model_type': model_type}
                 ).sort('created_at', -1).limit(12))
                 
@@ -441,7 +520,7 @@ def upload_data():
             df = pd.read_csv(upload_path)
             
             # Save upload info to MongoDB
-            if mongo:
+            if mongo_db:
                 try:
                     upload_info = {
                         'filename': file.filename,
@@ -450,7 +529,7 @@ def upload_data():
                         'columns': list(df.columns),
                         'created_at': datetime.utcnow()
                     }
-                    mongo.db.uploads.insert_one(upload_info)
+                    mongo_db.db.uploads.insert_one(upload_info)
                 except Exception as e:
                     print(f"⚠️ MongoDB upload logging failed: {e}")
             
@@ -472,9 +551,9 @@ def health_check():
     """Health check endpoint"""
     try:
         # Test MongoDB connection
-        if mongo:
+        if mongo_db:
             try:
-                mongo.db.command('ping')
+                mongo_db.db.command('ping')
                 db_status = 'connected'
             except Exception:
                 db_status = 'disconnected'
