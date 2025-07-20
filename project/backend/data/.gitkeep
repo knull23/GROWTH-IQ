@@ -1,0 +1,5 @@
+# Place your CSV data files here:
+# - fred_series.csv
+# - model_metrics.csv
+# - revenue_stats.csv
+# - scenario_inputs.csv

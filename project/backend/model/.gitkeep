@@ -1,0 +1,4 @@
+# Place your pre-trained model files here:
+# - lstm_model.h5
+# - sarima_model.pkl  
+# - scaler.pkl
